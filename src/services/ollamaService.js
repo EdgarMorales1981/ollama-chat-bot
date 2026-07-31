@@ -1,112 +1,335 @@
 // =====================================================
-// Servicio Ollama Cloud - funciona en dev (proxy Vite) y prod (Vercel)
+// Servicio Ollama Cloud
+//
+// Desarrollo:
+//   Usa el proxy configurado en vite.config.js:
+//   /ollama-api
+//
+// Producción:
+//   Usa la función serverless de Vercel:
+//   /api/ollama-proxy
 // =====================================================
 
-// En desarrollo: usa el proxy de Vite (/ollama-api)
-// En producción: usa el serverless function de Vercel (/api/ollama-proxy)
 const isDev = import.meta.env.DEV;
-const OLLAMA_HOST = isDev ? "/ollama-api" : "/api/ollama-proxy";
 
+const OLLAMA_HOST = isDev
+    ? "/ollama-api"
+    : "/api/ollama-proxy";
+
+const DEFAULT_CLOUD_MODEL =
+    "nemotron-3-ultra:cloud";
+
+// Modelo confirmado para Ollama Cloud.
+// Los demás modelos se obtendrán dinámicamente
+// mediante el endpoint /api/tags.
 export const CLOUD_MODELS = [
-    { name: "nemotron-3-ultra", size: "—", desc: "NVIDIA Ultra - Razonamiento maximo", tags: ["thinking", "tools"] },
-    { name: "nemotron-3-super", size: "215GB", desc: "NVIDIA Super - Alto rendimiento", tags: ["thinking", "tools"] },
-    { name: "nemotron-3-nano:30b", size: "30GB", desc: "NVIDIA Nano - Rapido", tags: ["thinking", "tools"] },
-    { name: "gpt-oss:120b", size: "61GB", desc: "GPT-OSS 120B - Avanzado", tags: ["thinking", "tools"] },
-    { name: "gpt-oss:20b", size: "13GB", desc: "GPT-OSS 20B - Ligero", tags: ["thinking", "tools"] },
-    { name: "kimi-k2.7-code", size: "554GB", desc: "Kimi K2.7 Code - Programacion", tags: ["vision", "thinking", "tools"] },
-    { name: "kimi-k2.6", size: "554GB", desc: "Kimi K2.6 - Contexto largo", tags: ["vision", "thinking", "tools"] },
-    { name: "glm-5.2", size: "—", desc: "GLM 5.2 - Ultima generacion", tags: ["thinking", "tools"] },
-    { name: "glm-5.1", size: "1404GB", desc: "GLM 5.1 - Complejo", tags: ["thinking", "tools"] },
-    { name: "minimax-m3", size: "—", desc: "MiniMax M3 - Multimodal", tags: ["vision", "thinking", "tools"] },
-    { name: "minimax-m2.7", size: "448GB", desc: "MiniMax M2.7 - General", tags: ["thinking", "tools"] },
-    { name: "deepseek-v4-pro", size: "1490GB", desc: "DeepSeek V4 Pro - Maxima calidad", tags: ["thinking", "tools"] },
-    { name: "deepseek-v4-flash", size: "130GB", desc: "DeepSeek V4 Flash - Rapido", tags: ["thinking", "tools"] },
-    { name: "qwen3.5:397b", size: "370GB", desc: "Qwen 3.5 - Multimodal", tags: ["vision", "thinking", "tools"] },
-    { name: "gemma4:31b", size: "58GB", desc: "Gemma 4 31B - Ligero", tags: ["vision", "thinking", "tools"] },
-    { name: "mistral-large-3:675b", size: "635GB", desc: "Mistral Large 3 - Pesado", tags: ["vision", "tools"] },
+    {
+        name: DEFAULT_CLOUD_MODEL,
+        size: "Cloud",
+        desc: "NVIDIA Ultra - Razonamiento avanzado",
+        tags: ["thinking", "tools", "cloud"],
+    },
 ];
 
-export async function streamChat(model, messages, onToken, signal) {
-    const response = await fetch(OLLAMA_HOST + "/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages, stream: true }),
-        signal,
-    });
+/**
+ * Convierte el modelo antiguo al identificador Cloud correcto.
+ */
+function normalizeModelName(model) {
+    const modelName =
+        typeof model === "string"
+            ? model
+            : model?.name;
 
-    if (!response.ok) {
-        let errMsg = "Error " + response.status;
-        try {
-            const errData = await response.json();
-            errMsg = errData.error || errMsg;
-        } catch {}
-        throw new Error(errMsg);
+    if (!modelName) {
+        return DEFAULT_CLOUD_MODEL;
     }
 
-    if (!response.body) throw new Error("No se recibio body");
+    if (modelName === "nemotron-3-ultra") {
+        return DEFAULT_CLOUD_MODEL;
+    }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullMessage = "";
-    let buffer = "";
+    return modelName;
+}
+
+/**
+ * Construye la URL correspondiente según el entorno.
+ */
+function getApiUrl(action) {
+    if (isDev) {
+        return `${OLLAMA_HOST}/api/${action}`;
+    }
+
+    if (action === "chat") {
+        return OLLAMA_HOST;
+    }
+
+    return `${OLLAMA_HOST}?action=${encodeURIComponent(
+        action
+    )}`;
+}
+
+/**
+ * Extrae el error real devuelto por el servidor.
+ */
+async function getResponseError(response) {
+    const fallbackMessage =
+        `Error HTTP ${response.status}`;
 
     try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+        const text = await response.text();
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() ?? "";
+        if (!text) {
+            return fallbackMessage;
+        }
 
-            for (const line of lines) {
-                if (!line.trim()) continue;
-                try {
-                    const json = JSON.parse(line);
-                    if (json.message && json.message.content) {
-                        fullMessage += json.message.content;
-                        onToken(json.message.content);
-                    }
-                } catch {}
+        try {
+            const data = JSON.parse(text);
+
+            return (
+                data.details ||
+                data.error ||
+                fallbackMessage
+            );
+        } catch {
+            return text;
+        }
+    } catch {
+        return fallbackMessage;
+    }
+}
+
+/**
+ * Procesa una línea NDJSON recibida desde Ollama.
+ */
+function processStreamLine(
+    line,
+    onToken
+) {
+    const cleanLine = line.trim();
+
+    if (!cleanLine) {
+        return "";
+    }
+
+    let data;
+
+    try {
+        data = JSON.parse(cleanLine);
+    } catch {
+        console.warn(
+            "Línea NDJSON inválida:",
+            cleanLine
+        );
+
+        return "";
+    }
+
+    if (data.error) {
+        throw new Error(data.error);
+    }
+
+    const token =
+        data.message?.content || "";
+
+    if (token) {
+        onToken(token);
+    }
+
+    return token;
+}
+
+/**
+ * Chat con respuesta por streaming.
+ */
+export async function streamChat(
+    model,
+    messages,
+    onToken,
+    signal
+) {
+    if (!Array.isArray(messages)) {
+        throw new Error(
+            "messages debe ser un arreglo."
+        );
+    }
+
+    if (typeof onToken !== "function") {
+        throw new Error(
+            "onToken debe ser una función."
+        );
+    }
+
+    const selectedModel =
+        normalizeModelName(model);
+
+    const response = await fetch(
+        getApiUrl("chat"),
+        {
+            method: "POST",
+            headers: {
+                "Content-Type":
+                    "application/json",
+                Accept:
+                    "application/x-ndjson",
+            },
+            body: JSON.stringify({
+                model: selectedModel,
+                messages,
+                stream: true,
+            }),
+            signal,
+        }
+    );
+
+    if (!response.ok) {
+        const errorMessage =
+            await getResponseError(response);
+
+        throw new Error(errorMessage);
+    }
+
+    if (!response.body) {
+        throw new Error(
+            "El servidor no devolvió contenido."
+        );
+    }
+
+    const reader =
+        response.body.getReader();
+
+    const decoder =
+        new TextDecoder("utf-8");
+
+    let buffer = "";
+    let fullMessage = "";
+
+    while (true) {
+        const { done, value } =
+            await reader.read();
+
+        if (done) {
+            break;
+        }
+
+        buffer += decoder.decode(
+            value,
+            {
+                stream: true,
             }
-        }
+        );
 
-        if (buffer.trim()) {
-            try {
-                const json = JSON.parse(buffer);
-                if (json.message && json.message.content) {
-                    fullMessage += json.message.content;
-                    onToken(json.message.content);
-                }
-            } catch {}
+        const lines =
+            buffer.split("\n");
+
+        buffer =
+            lines.pop() || "";
+
+        for (const line of lines) {
+            const token =
+                processStreamLine(
+                    line,
+                    onToken
+                );
+
+            fullMessage += token;
         }
-    } finally {
-        reader.cancel();
+    }
+
+    buffer += decoder.decode();
+
+    if (buffer.trim()) {
+        const token =
+            processStreamLine(
+                buffer,
+                onToken
+            );
+
+        fullMessage += token;
     }
 
     return fullMessage;
 }
 
+/**
+ * Obtiene los modelos disponibles.
+ */
 export async function getModels() {
-    try {
-        const response = await fetch(OLLAMA_HOST + "/tags");
-        if (!response.ok) return [];
-        const data = await response.json();
-        return data.models || [];
-    } catch {
-        return [];
+    const response = await fetch(
+        getApiUrl("tags"),
+        {
+            method: "GET",
+            headers: {
+                Accept:
+                    "application/json",
+            },
+        }
+    );
+
+    if (!response.ok) {
+        const errorMessage =
+            await getResponseError(response);
+
+        throw new Error(errorMessage);
     }
+
+    const data =
+        await response.json();
+
+    if (!Array.isArray(data.models)) {
+        return CLOUD_MODELS;
+    }
+
+    const models = data.models.map(
+        (model) => ({
+            ...model,
+            name:
+                normalizeModelName(
+                    model.name
+                ),
+        })
+    );
+
+    return models.length > 0
+        ? models
+        : CLOUD_MODELS;
 }
 
+/**
+ * Verifica la conexión con Ollama Cloud.
+ *
+ * Se utiliza /api/tags porque permite comprobar:
+ * 1. Que la función serverless existe.
+ * 2. Que la API key está configurada.
+ * 3. Que Ollama acepta la autenticación.
+ */
 export async function checkOllamaStatus() {
-    try {
-        const response = await fetch(OLLAMA_HOST + "/version");
-        if (response.ok) {
-            const data = await response.json();
-            return data.version || "cloud";
+    const response = await fetch(
+        getApiUrl("tags"),
+        {
+            method: "GET",
+            headers: {
+                Accept:
+                    "application/json",
+            },
+            cache: "no-store",
         }
-        return false;
-    } catch {
-        return false;
+    );
+
+    if (!response.ok) {
+        const errorMessage =
+            await getResponseError(response);
+
+        throw new Error(errorMessage);
     }
+
+    const data =
+        await response.json();
+
+    return {
+        connected: true,
+        modelCount:
+            Array.isArray(data.models)
+                ? data.models.length
+                : 0,
+    };
 }
